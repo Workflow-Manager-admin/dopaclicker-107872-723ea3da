@@ -12,7 +12,7 @@ Implements endpoints for:
 All endpoints are modular and ready for further extension.
 """
 
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
@@ -45,14 +45,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mock in-memory data for demonstration
+from datetime import datetime
+from . import game_mechanics
+
+# Mock in-memory data stores
 USERS: Dict[str, "User"] = {}
 GAMES: Dict[str, "GameState"] = {}
 LEADERBOARD: List["LeaderboardEntry"] = []
 UPGRADES: Dict[str, "Upgrade"] = {}
 REWARDS: Dict[str, "RewardClaim"] = {}
+ACHIEVEMENTS: Dict[str, List["Achievement"]] = {}
 
 ############### MODELS ##################
+
+class Achievement(BaseModel):
+    """Represents a player achievement."""
+    id: str = Field(default_factory=lambda: str(uuid4()), description="Achievement ID")
+    type: str = Field(..., description="Achievement type (clicks, level, points)")
+    tier: int = Field(..., description="Achievement tier/level")
+    title: str = Field(..., description="Display title")
+    reward: int = Field(..., description="Reward amount in dopamine points")
+    claimed: bool = Field(False, description="Whether reward was claimed")
+    timestamp_earned: Optional[str] = Field(None, description="When achievement was earned")
 
 # PUBLIC_INTERFACE
 class User(BaseModel):
@@ -181,10 +195,300 @@ class AudiusTrack(BaseModel):
 def health_check():
     """
     Health check endpoint.
-
     Returns message and service health status.
     """
     return {"message": "Healthy"}
+
+# PUBLIC_INTERFACE
+@app.post("/game/click/{user_id}", tags=["Game"])
+async def register_click(user_id: str):
+    """
+    Register a click action for a user.
+    - Updates click count
+    - Calculates points earned
+    - Checks for level up
+    - Updates leaderboard
+    - Returns updated game state
+    """
+    user = get_fake_user(user_id)
+    game_state = get_fake_game_state(user_id)
+    
+    # Calculate click value and points
+    click_value = game_mechanics.calculate_click_value(
+        game_state.level,
+        [UPGRADES[upgrade_id] for upgrade_id in game_state.upgrades]
+    )
+    
+    # Update XP and check level
+    new_xp, new_level, did_level_up = game_mechanics.calculate_progression(
+        game_state.dopamine_points,  # Using points as XP for simplicity
+        game_state.level,
+        click_value
+    )
+    
+    # Update states
+    game_state.total_clicks += 1
+    game_state.dopamine_points = new_xp
+    game_state.level = new_level
+    game_state.last_active = datetime.utcnow().isoformat()
+    
+    # Update user record
+    user.total_clicks += 1
+    user.current_level = new_level
+    user.dopamine_points = new_xp
+    
+    # Check achievements
+    new_achievements = game_mechanics.check_for_achievements(
+        game_state.total_clicks,
+        game_state.level,
+        game_state.dopamine_points
+    )
+    
+    # Record any new achievements
+    if user_id not in ACHIEVEMENTS:
+        ACHIEVEMENTS[user_id] = []
+    
+    for achievement in new_achievements:
+        # Only add if not already earned
+        if not any(a.type == achievement["type"] and a.tier == achievement["tier"] 
+                  for a in ACHIEVEMENTS[user_id]):
+            ACHIEVEMENTS[user_id].append(Achievement(
+                type=achievement["type"],
+                tier=achievement["tier"],
+                title=achievement["title"],
+                reward=achievement["reward"],
+                timestamp_earned=datetime.utcnow().isoformat()
+            ))
+    
+    # Update leaderboard
+    update_leaderboard()
+    
+    return {
+        "game_state": game_state,
+        "click_value": click_value,
+        "leveled_up": did_level_up,
+        "new_achievements": new_achievements
+    }
+
+# PUBLIC_INTERFACE
+@app.get("/game/state/{user_id}", tags=["Game"])
+async def get_game_state(user_id: str):
+    """
+    Get current game state for a user.
+    Returns full game state including:
+    - Click stats
+    - Level and XP
+    - Owned upgrades
+    - Available upgrades
+    - Unclaimed achievements
+    """
+    game_state = get_fake_game_state(user_id)
+    
+    # Get available upgrades for current level
+    available_upgrades = []
+    for category, tiers in game_mechanics.UPGRADE_TIERS.items():
+        for upgrade in tiers:
+            if (upgrade["level"] <= game_state.level and 
+                not any(u.id == f"{category}_{upgrade['level']}" 
+                       for u in [UPGRADES[uid] for uid in game_state.upgrades])):
+                available_upgrades.append(
+                    Upgrade(
+                        id=f"{category}_{upgrade['level']}",
+                        name=f"{category.replace('_', ' ').title()} {upgrade['level']}",
+                        description=f"Increases {category} by {upgrade['multiplier']}",
+                        cost=upgrade["cost"],
+                        multiplier=upgrade["multiplier"],
+                        level_required=upgrade["level"]
+                    )
+                )
+    
+    # Get unclaimed achievements
+    unclaimed_achievements = []
+    if user_id in ACHIEVEMENTS:
+        unclaimed_achievements = [
+            a for a in ACHIEVEMENTS[user_id] if not a.claimed
+        ]
+    
+    return {
+        "game_state": game_state,
+        "available_upgrades": available_upgrades,
+        "unclaimed_achievements": unclaimed_achievements,
+        "next_level_xp": game_mechanics.calculate_xp_for_level(game_state.level)
+    }
+
+# PUBLIC_INTERFACE
+@app.post("/game/purchase_upgrade/{user_id}/{upgrade_id}", tags=["Upgrades"])
+async def purchase_upgrade(user_id: str, upgrade_id: str):
+    """
+    Purchase an upgrade for a user.
+    - Validates upgrade availability
+    - Checks if user can afford it
+    - Applies upgrade effects
+    - Updates game state
+    """
+    game_state = get_fake_game_state(user_id)
+    user = get_fake_user(user_id)
+    
+    # Parse upgrade type and level
+    try:
+        category, level = upgrade_id.rsplit("_", 1)
+        level = int(level)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid upgrade ID format")
+    
+    # Validate upgrade exists
+    if category not in game_mechanics.UPGRADE_TIERS:
+        raise HTTPException(status_code=404, detail="Upgrade category not found")
+    
+    # Find upgrade tier
+    upgrade_tier = None
+    for tier in game_mechanics.UPGRADE_TIERS[category]:
+        if tier["level"] == level:
+            upgrade_tier = tier
+            break
+    
+    if not upgrade_tier:
+        raise HTTPException(status_code=404, detail="Upgrade tier not found")
+    
+    # Validate level requirement
+    if game_state.level < upgrade_tier["level"]:
+        raise HTTPException(status_code=403, detail="Level requirement not met")
+    
+    # Check if already owned
+    if upgrade_id in game_state.upgrades:
+        raise HTTPException(status_code=400, detail="Upgrade already owned")
+    
+    # Check if can afford
+    if game_state.dopamine_points < upgrade_tier["cost"]:
+        raise HTTPException(status_code=403, detail="Insufficient dopamine points")
+    
+    # Create upgrade instance
+    upgrade = Upgrade(
+        id=upgrade_id,
+        name=f"{category.replace('_', ' ').title()} {level}",
+        description=f"Increases {category} by {upgrade_tier['multiplier']}",
+        cost=upgrade_tier["cost"],
+        multiplier=upgrade_tier["multiplier"],
+        level_required=upgrade_tier["level"]
+    )
+    
+    # Apply upgrade
+    UPGRADES[upgrade_id] = upgrade
+    game_state.upgrades.append(upgrade_id)
+    game_state.dopamine_points -= upgrade_tier["cost"]
+    user.dopamine_points = game_state.dopamine_points
+    
+    # Update leaderboard
+    update_leaderboard()
+    
+    return {
+        "game_state": game_state,
+        "upgrade": upgrade
+    }
+
+# PUBLIC_INTERFACE
+@app.post("/game/claim_achievement/{user_id}/{achievement_id}", tags=["Rewards"])
+async def claim_achievement(user_id: str, achievement_id: str):
+    """
+    Claim the reward for an achievement.
+    - Validates achievement is earned and unclaimed
+    - Awards dopamine points
+    - Marks achievement as claimed
+    """
+    if user_id not in ACHIEVEMENTS:
+        raise HTTPException(status_code=404, detail="No achievements found for user")
+    
+    # Find achievement
+    achievement = None
+    for a in ACHIEVEMENTS[user_id]:
+        if a.id == achievement_id:
+            achievement = a
+            break
+    
+    if not achievement:
+        raise HTTPException(status_code=404, detail="Achievement not found")
+    
+    if achievement.claimed:
+        raise HTTPException(status_code=400, detail="Achievement already claimed")
+    
+    # Update game state and user
+    game_state = get_fake_game_state(user_id)
+    user = get_fake_user(user_id)
+    
+    game_state.dopamine_points += achievement.reward
+    user.dopamine_points = game_state.dopamine_points
+    
+    # Mark claimed
+    achievement.claimed = True
+    achievement.timestamp_earned = datetime.utcnow().isoformat()
+    
+    # Update leaderboard
+    update_leaderboard()
+    
+    return {
+        "game_state": game_state,
+        "achievement": achievement,
+        "reward": achievement.reward
+    }
+
+# PUBLIC_INTERFACE
+@app.get("/game/leaderboard", tags=["Leaderboard"])
+async def get_leaderboard(
+    sort_by: str = Query(
+        "dopamine_points",
+        description="Sort field: dopamine_points, total_clicks, or level"
+    )
+):
+    """
+    Get current leaderboard standings.
+    - Returns top 50 players
+    - Sortable by different metrics
+    """
+    if sort_by not in ["dopamine_points", "total_clicks", "level"]:
+        raise HTTPException(status_code=400, detail="Invalid sort field")
+    
+    # Sort leaderboard by requested field
+    sorted_board = sorted(
+        LEADERBOARD,
+        key=lambda x: getattr(x, sort_by),
+        reverse=True
+    )[:50]
+    
+    return {
+        "leaderboard": sorted_board,
+        "total_players": len(USERS),
+        "sort_field": sort_by
+    }
+
+# PUBLIC_INTERFACE
+@app.post("/game/register/{username}", tags=["Game"])
+async def register_user(username: str):
+    """
+    Register a new user and initialize their game state.
+    Returns user ID and initial game state.
+    """
+    # Create user
+    user = User(username=username)
+    USERS[user.id] = user
+    
+    # Initialize game state
+    game_state = GameState(
+        user_id=user.id,
+        total_clicks=0,
+        dopamine_points=0,
+        level=1,
+        upgrades=[],
+        last_active=datetime.utcnow().isoformat()
+    )
+    GAMES[user.id] = game_state
+    
+    # Add to leaderboard
+    update_leaderboard()
+    
+    return {
+        "user": user,
+        "game_state": game_state
+    }
 
 # PUBLIC_INTERFACE
 @app.get("/external/news_headlines", tags=["Integrations"], summary="Get news headlines", description="Fetch latest headlines from NewsAPI and return as normalized objects.")
