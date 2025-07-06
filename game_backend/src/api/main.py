@@ -12,11 +12,17 @@ Implements endpoints for:
 All endpoints are modular and ready for further extension.
 """
 
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 from uuid import uuid4
+import httpx
+import os
+from dotenv import load_dotenv
+
+# Load .env for API keys
+load_dotenv()
 
 app = FastAPI(
     title="Dopamine Clicker Backend",
@@ -27,6 +33,7 @@ app = FastAPI(
         {"name": "Upgrades", "description": "Upgrade actions"},
         {"name": "Leaderboard", "description": "Leaderboard endpoints"},
         {"name": "Rewards", "description": "Reward claiming endpoints"},
+        {"name": "Integrations", "description": "3rd party API integrations for enrichment (News, Meme, Audius)"},
     ]
 )
 
@@ -125,6 +132,49 @@ def update_leaderboard():
     # Sort by: dopamine > clicks > level
     LEADERBOARD = sorted(entries, key=lambda e: (e.dopamine_points, e.total_clicks, e.level), reverse=True)[:50]
 
+############### 3RD PARTY INTEGRATION MODELS ##################
+
+# PUBLIC_INTERFACE
+class NewsHeadline(BaseModel):
+    """Single news headline from NewsAPI."""
+    source_name: str
+    author: Optional[str]
+    title: str
+    description: Optional[str]
+    url: str
+    urlToImage: Optional[str]
+    publishedAt: str
+
+# PUBLIC_INTERFACE
+class MemeTemplate(BaseModel):
+    """Meme template info from Imgflip."""
+    id: str
+    name: str
+    url: str
+    width: int
+    height: int
+    box_count: int
+
+# PUBLIC_INTERFACE
+class MemeCreateRequest(BaseModel):
+    template_id: str = Field(..., description="ID of the Imgflip template.")
+    top_text: str = Field(..., description="Text for the top of the meme.")
+    bottom_text: str = Field(..., description="Text for the bottom of the meme.")
+
+# PUBLIC_INTERFACE
+class MemeCreateResponse(BaseModel):
+    url: str = Field(..., description="URL of the generated meme image.")
+    page_url: Optional[str] = Field(None, description="Optional page showing the meme.")
+
+# PUBLIC_INTERFACE
+class AudiusTrack(BaseModel):
+    """A trending Audius track normalized for frontend."""
+    id: str
+    title: str
+    artist: Optional[str]
+    permalink: str
+    artwork_url: Optional[str]
+
 ############### ENDPOINTS ##################
 
 @app.get("/", tags=["Game"])
@@ -137,151 +187,155 @@ def health_check():
     return {"message": "Healthy"}
 
 # PUBLIC_INTERFACE
-@app.post("/click", tags=["Game"], summary="Register a click", description="Increment clicks and return updated game state.")
-def click(user_id: str = Body(..., embed=True)) -> GameState:
+@app.get("/external/news_headlines", tags=["Integrations"], summary="Get news headlines", description="Fetch latest headlines from NewsAPI and return as normalized objects.")
+async def get_news_headlines(
+    q: str = Query("technology", description="Search topic (default: technology)"),
+    language: str = Query("en", description="Language code (default: en)"),
+    country: Optional[str] = Query(None, description="Optional country code"),
+    max_results: int = Query(10, ge=1, le=100, description="Max headlines"),
+):
     """
-    Registers a click action for the given user, increases dopamine points, and returns the updated game state.
-
-    - **user_id**: ID of the user performing the click.
-    Returns the updated GameState.
+    Returns a list of top news headlines using NewsAPI (https://newsapi.org/).
+    Parameters:
+        - q: Use as news search
+        - language: Language code
+        - country: Optional country filter
+        - max_results: Limit the number 
     """
-    user = get_fake_user(user_id)
-    game = get_fake_game_state(user_id)
-    # Apply upgrades, etc. (fake logic)
-    click_value = 1.0
-    for upg_id in game.upgrades:
-        upg = UPGRADES.get(upg_id)
-        if upg:
-            click_value *= upg.multiplier
-    # Update state
-    game.total_clicks += int(click_value)
-    game.dopamine_points += int(click_value)
-    user.total_clicks = game.total_clicks
-    user.dopamine_points = game.dopamine_points
-    GAMES[user_id] = game
-    USERS[user_id] = user
-    update_leaderboard()
-    return game
-
-# PUBLIC_INTERFACE
-@app.get("/game_state", tags=["Game"], summary="Get a user's game state", description="Returns the latest game state for provided user.")
-def get_game_state(user_id: str) -> GameState:
-    """
-    Fetches the game state for a given user.
-
-    - **user_id**: ID of the user
-    """
-    return get_fake_game_state(user_id)
-
-# PUBLIC_INTERFACE
-@app.post("/game_state", tags=["Game"], summary="Set game state", description="Allows setting/replacing the full game state for a user.")
-def set_game_state(state: GameState) -> GameState:
-    """
-    Sets the provided game state for a user (overwrites existing).
-
-    - **state**: GameState object
-    """
-    GAMES[state.user_id] = state
-    user = USERS.get(state.user_id)
-    if user:
-        user.total_clicks = state.total_clicks
-        user.dopamine_points = state.dopamine_points
-        user.current_level = state.level
-        USERS[user.id] = user
-    update_leaderboard()
-    return state
+    NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+    if not NEWSAPI_KEY:
+        raise HTTPException(status_code=500, detail="NewsAPI key not set in environment.")
+    url = "https://newsapi.org/v2/top-headlines"
+    params = {"apiKey": NEWSAPI_KEY, "language": language, "pageSize": max_results, "q": q}
+    if country:
+        params["country"] = country
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        r = await client.get(url, params=params)
+        if r.status_code != 200:
+            raise HTTPException(status_code=503, detail="Failed to fetch news headlines.")
+        data = r.json()
+        if "articles" not in data:
+            raise HTTPException(status_code=502, detail="Invalid NewsAPI response.")
+        headlines = []
+        for art in data["articles"]:
+            headlines.append(
+                NewsHeadline(
+                    source_name=art.get("source", {}).get("name", ""),
+                    author=art.get("author"),
+                    title=art.get("title", ""),
+                    description=art.get("description"),
+                    url=art.get("url", ""),
+                    urlToImage=art.get("urlToImage"),
+                    publishedAt=art.get("publishedAt", ""),
+                )
+            )
+        return headlines
 
 # PUBLIC_INTERFACE
-@app.post("/upgrade/purchase", tags=["Upgrades"], summary="Purchase upgrade", description="Buy an upgrade using dopamine points.")
-def purchase_upgrade(
-    user_id: str = Body(..., embed=True),
-    upgrade_id: str = Body(..., embed=True),
-) -> GameState:
+@app.get(
+    "/external/meme_templates",
+    tags=["Integrations"],
+    summary="Get meme templates (Imgflip)",
+    description="Fetch popular meme templates from Imgflip for use in meme generation."
+)
+async def get_imgflip_templates(limit: int = Query(20, ge=1, le=100, description="Max templates")) -> List[MemeTemplate]:
     """
-    Purchases an upgrade for the user if requirements and dopamine points are met.
-
-    - **user_id**: User ID
-    - **upgrade_id**: Upgrade ID
-    Returns updated GameState
+    Gets popular meme templates from the Imgflip API.
+    - Returns meme templates for use in custom meme creation.
     """
-    user = get_fake_user(user_id)
-    game = get_fake_game_state(user_id)
-    upgrade = UPGRADES.get(upgrade_id)
-    if not upgrade:
-        raise HTTPException(status_code=404, detail="Upgrade not found")
-    if upgrade.id in game.upgrades:
-        raise HTTPException(status_code=400, detail="Upgrade already owned")
-    if upgrade.cost > game.dopamine_points:
-        raise HTTPException(status_code=400, detail="Not enough dopamine points")
-    if user.current_level < upgrade.level_required:
-        raise HTTPException(status_code=400, detail="Level not high enough")
-    # Purchase it!
-    game.dopamine_points -= upgrade.cost
-    game.upgrades.append(upgrade.id)
-    user.dopamine_points = game.dopamine_points
-    GAMES[user_id] = game
-    USERS[user_id] = user
-    return game
-
-# PUBLIC_INTERFACE
-@app.get("/leaderboard", tags=["Leaderboard"], summary="Get leaderboard", description="Fetch current leaderboard standings (top 50).")
-def get_leaderboard() -> List[LeaderboardEntry]:
-    """
-    Returns the current leaderboard sorted by dopamine points and clicks.
-    """
-    update_leaderboard()
-    return LEADERBOARD
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get("https://api.imgflip.com/get_memes")
+        if resp.status_code != 200:
+            raise HTTPException(status_code=503, detail="Imgflip API error")
+        data = resp.json()
+        if not data.get("success") or "memes" not in data.get("data", {}):
+            raise HTTPException(status_code=502, detail="Invalid Imgflip API response")
+        memes = [
+            MemeTemplate(
+                id=meme["id"],
+                name=meme["name"],
+                url=meme["url"],
+                width=meme["width"],
+                height=meme["height"],
+                box_count=meme["box_count"]
+            )
+            for meme in data["data"]["memes"][:limit]
+        ]
+        return memes
 
 # PUBLIC_INTERFACE
-@app.post("/reward/claim", tags=["Rewards"], summary="Claim a reward", description="Claim a dopamine reward for user.")
-def claim_reward(
-    user_id: str = Body(..., embed=True),
-    reward_type: str = Body(..., embed=True)
-) -> RewardClaim:
+@app.post(
+    "/external/create_meme",
+    tags=["Integrations"],
+    summary="Generate meme (Imgflip)",
+    description="Generate a meme image using Imgflip meme generator."
+)
+async def create_imgflip_meme(req: MemeCreateRequest) -> MemeCreateResponse:
     """
-    Claims a specified reward for a user (if available).
-
-    - **user_id**: User ID
-    - **reward_type**: Type of reward ('daily_bonus', etc.)
-
-    Returns RewardClaim object.
+    Generate a meme image using Imgflip (https://imgflip.com/api).
+    Uses the official demo account as allowed by Imgflip API docs for testing.
+    - template_id, top_text, bottom_text must be provided.
     """
-    key = f"{user_id}_{reward_type}"
-    if key in REWARDS and REWARDS[key].claimed:
-        raise HTTPException(status_code=400, detail="Reward already claimed")
-    # Fake: award random dopamine (can be more clever!)
-    reward = RewardClaim(
-        user_id=user_id,
-        reward_type=reward_type,
-        claimed=True,
-        dopamine_points=20  # Demo
-    )
-    REWARDS[key] = reward
-    user = get_fake_user(user_id)
-    user.dopamine_points += reward.dopamine_points
-    USERS[user.id] = user
-    game = get_fake_game_state(user_id)
-    game.dopamine_points = user.dopamine_points
-    GAMES[user_id] = game
-    return reward
+    IMGFLIP_USERNAME = os.getenv("IMGFLIP_USERNAME", "imgflip_hubot")  # Default: demo
+    IMGFLIP_PASSWORD = os.getenv("IMGFLIP_PASSWORD", "imgflip_hubot")
+    payload = {
+        "template_id": req.template_id,
+        "username": IMGFLIP_USERNAME,
+        "password": IMGFLIP_PASSWORD,
+        "text0": req.top_text,
+        "text1": req.bottom_text
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post("https://api.imgflip.com/caption_image", data=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=503, detail="Imgflip meme generation error")
+        data = r.json()
+        if not data.get("success") or "url" not in data.get("data", {}):
+            raise HTTPException(status_code=502, detail="Invalid Imgflip meme API response")
+        return MemeCreateResponse(
+            url=data["data"]["url"],
+            page_url=data["data"].get("page_url")
+        )
 
-# --- Example Data Initialization (for testing/local dev) ---
-@app.on_event("startup")
-def initialize_example_data():
-    """Seeds demo users, upgrades for standalone testing."""
-    # Only add if not present
-    if not USERS:
-        u1 = User(username="PlayerOne")
-        u2 = User(username="Clicky")
-        USERS[u1.id] = u1
-        USERS[u2.id] = u2
-        GAMES[u1.id] = GameState(user_id=u1.id)
-        GAMES[u2.id] = GameState(user_id=u2.id)
-    if not UPGRADES:
-        upg1 = Upgrade(name="Double Clicker", description="Clicks count x2!", cost=50, multiplier=2, level_required=2)
-        upg2 = Upgrade(name="Quick Thumb", description="Faster dopamine gain", cost=120, multiplier=1.25, level_required=3)
-        UPGRADES[upg1.id] = upg1
-        UPGRADES[upg2.id] = upg2
+# PUBLIC_INTERFACE
+@app.get(
+    "/external/audius_trending",
+    tags=["Integrations"],
+    summary="Get trending tracks (Audius)",
+    description="Fetch trending tracks from Audius for discoverable listening."
+)
+async def get_audius_trending(
+    genre: Optional[str] = Query(None, description="Music genre filter"),
+    limit: int = Query(10, ge=1, le=100, description="Max tracks")
+) -> List[AudiusTrack]:
+    """
+    Fetch trending tracks from Audius (https://audius.co/api/docs).
+    Parameters:
+        - genre: Optional genre filter
+        - limit: Limit to max tracks (default 10)
+    """
+    query = {"limit": limit}
+    if genre:
+        query["genre"] = genre
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        r = await client.get("https://discoveryprovider.audius.io/v1/tracks/trending", params=query)
+        if r.status_code != 200:
+            raise HTTPException(status_code=503, detail="Audius trending fetch error")
+        data = r.json()
+        if "data" not in data:
+            raise HTTPException(status_code=502, detail="Invalid Audius response")
+        results = [
+            AudiusTrack(
+                id=tr["id"],
+                title=tr["title"],
+                artist=(tr["user"]["name"] if isinstance(tr.get("user"), dict) else None),
+                permalink=tr.get("permalink", ""),
+                artwork_url=(tr.get("artwork", {}).get("150x150") if isinstance(tr.get("artwork"), dict) else None)
+            )
+            for tr in data["data"][:limit]
+        ]
+        return results
 
 # --- Modularization Note ---
 # For production: Move models to `models.py`, implement persistent DB layer, add authentication, etc.
+
